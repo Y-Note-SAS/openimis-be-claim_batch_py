@@ -13,10 +13,12 @@ from django.db import connection, transaction, DatabaseError
 from django.db.models import Value, F, Sum, Q, Prefetch, Count, Subquery, OuterRef, FloatField, TextField
 from django.db.models.functions import Coalesce, ExtractMonth, ExtractYear, Cast
 from django.utils.translation import gettext as _
+from django.conf import settings
+from core.models import InteractiveUser
 
 from calculation.services import run_calculation_rules, get_calculation_object
 from claim.models import ClaimItem, Claim, ClaimService, ClaimDetail
-from claim_batch.models import BatchRun, RelativeIndex, RelativeDistribution
+from claim_batch.models import BatchRun, RelativeIndex, RelativeDistribution, BATCH_LOCATION_TYPES
 from contribution.models import Premium
 from contribution_plan.models import PaymentPlan
 from core.signals import *
@@ -32,6 +34,41 @@ logger = logging.getLogger(__name__)
 def product_content_type():
     # Wrapped in function as property is not compliant with type and static variable fails migrations.
     return ContentType.objects.get_for_model(Product)
+
+
+def is_location_restricted(user):
+    """
+    True when row security narrows `user` to the locations of their districts: not for an
+    imis admin, nor a technical user (the location filter does not narrow them either),
+    nor anyone when ROW_SECURITY is off.
+    """
+    if not settings.ROW_SECURITY:
+        return False
+    if user is None or getattr(user, "is_anonymous", True):
+        return True
+    scoping = getattr(user, "_u", user)
+    if not isinstance(scoping, InteractiveUser):
+        return False
+    return not scoping.is_imis_admin
+
+
+def batch_location_allowed(user, location_id):
+    """
+    Whether `user` may run / read the batch of `location_id`: a current region or district
+    within their scope (a region only with all its districts, as BatchRun.row_scope
+    reads it); national (None) only for a user who is not location restricted.
+    """
+    if location_id is None:
+        return not is_location_restricted(user)
+    try:
+        location_id = int(location_id)
+    except (TypeError, ValueError):
+        return False
+    locations = Location.objects.filter(
+        id=location_id, type__in=BATCH_LOCATION_TYPES, validity_to__isnull=True)
+    if is_location_restricted(user):
+        locations = locations.filter(*BatchRun.filter_location(user, paths=("id",)))
+    return locations.exists()
 
 
 @core.comparable

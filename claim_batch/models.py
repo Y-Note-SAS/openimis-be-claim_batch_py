@@ -2,6 +2,7 @@ import uuid
 
 from core import fields
 from core import models as core_models
+from django.conf import settings
 from django.db import models
 from django.utils.translation import gettext_lazy
 from location import models as location_models
@@ -10,7 +11,30 @@ from product import models as product_models
 from product.models import Product
 
 
+#: a batch run / relative index is run for a region, a district or nationally (null)
+BATCH_LOCATION_TYPES = ("R", "D")
+
+
+def _location_scoped(cls, queryset, user, validity, audits):
+    """
+    The rows of `cls` whose location the user may see; a null location (national) stays
+    visible, as in build_user_location_filter_query. Current rows unless validity /
+    audits ask otherwise (OP-2029).
+    """
+    queryset = cls.apply_row_filters(queryset, validity, audits, default=cls.filter_queryset)
+    user = cls.scoping_user(user)
+    if settings.ROW_SECURITY and (user is None or getattr(user, "is_anonymous", True)):
+        return queryset.none()
+    if not settings.ROW_SECURITY:
+        return queryset
+    return cls.row_scope.filter(queryset, user, cls)
+
+
 class BatchRun(core_models.VersionedModel):
+    # seen by whoever sees its region / district (a region only with all its districts);
+    # a national run (no location) by every user holding the right
+    row_scope = core_models.LocationScope("location", loc_types=BATCH_LOCATION_TYPES)
+
     id = models.AutoField(db_column='RunID', primary_key=True)
     location = models.ForeignKey(
         location_models.Location, models.DO_NOTHING,
@@ -20,12 +44,19 @@ class BatchRun(core_models.VersionedModel):
     run_year = models.IntegerField(db_column='RunYear')
     run_month = models.SmallIntegerField(db_column='RunMonth')
 
+    @classmethod
+    def get_queryset(cls, queryset, user=None, *, validity=None, audits=None):
+        return _location_scoped(cls, queryset, user, validity, audits)
+
     class Meta:
         managed = True
         db_table = 'tblBatchRun'
 
 
 class RelativeIndex(core_models.VersionedModel):
+    # same rule as the batch run computing it: its region / district, national = null
+    row_scope = core_models.LocationScope("location", loc_types=BATCH_LOCATION_TYPES)
+
     id = models.AutoField(db_column='RelIndexID', primary_key=True)
     product = models.ForeignKey(
         product_models.Product, models.DO_NOTHING, db_column='ProdID')
@@ -41,6 +72,10 @@ class RelativeIndex(core_models.VersionedModel):
         location_models.Location, models.DO_NOTHING, db_column='LocationId', blank=True, null=True,
         related_name="relative_indexes"
     )
+
+    @classmethod
+    def get_queryset(cls, queryset, user=None, *, validity=None, audits=None):
+        return _location_scoped(cls, queryset, user, validity, audits)
 
     class Meta:
         managed = True
