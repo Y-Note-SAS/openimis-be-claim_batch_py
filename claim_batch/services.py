@@ -39,17 +39,15 @@ def product_content_type():
 def is_location_restricted(user):
     """
     True when row security narrows `user` to the locations of their districts: not for an
-    imis admin, nor a technical user (the location filter does not narrow them either),
-    nor anyone when ROW_SECURITY is off.
+    imis admin, a holder of the unscoped-location right or a technical user
+    (location.models.is_location_unscoped), nor anyone when ROW_SECURITY is off.
     """
     if not settings.ROW_SECURITY:
         return False
     if user is None or getattr(user, "is_anonymous", True):
         return True
-    scoping = getattr(user, "_u", user)
-    if not isinstance(scoping, InteractiveUser):
-        return False
-    return not scoping.is_imis_admin
+    from location.models import is_location_unscoped
+    return not is_location_unscoped(user)
 
 
 def batch_location_allowed(user, location_id):
