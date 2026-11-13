@@ -3,18 +3,19 @@ from django.core.exceptions import PermissionDenied
 from django.db import connection
 from core import prefix_filterset, ExtendedConnection
 from core.schema import OpenIMISMutation, OrderedDjangoFilterConnectionField
+from core.gql import ScopedQuerysetMixin, legacy_row_filters, row_filter_arguments
+from core.models import Validity
 from graphene import ObjectType
 from graphene_django import DjangoObjectType
-from graphene_django.filter import DjangoFilterConnectionField
 from product.schema import ProductGQLType
 from location.schema import LocationGQLType
 from .models import BatchRun, RelativeIndex
-from .services import ProcessBatchSubmit, ProcessBatchService
+from .services import ProcessBatchSubmit, ProcessBatchService, batch_location_allowed
 from .apps import ClaimBatchConfig
 from django.utils.translation import gettext as _
 from django.conf import settings
 
-class BatchRunGQLType(DjangoObjectType):
+class BatchRunGQLType(ScopedQuerysetMixin, DjangoObjectType):
     class Meta:
         model = BatchRun
         interfaces = (graphene.relay.Node,)
@@ -78,7 +79,7 @@ class BatchRunSummaryConnection(graphene.Connection):
         return len(self.iterable)
 
 
-class RelativeIndexGQLType(DjangoObjectType):
+class RelativeIndexGQLType(ScopedQuerysetMixin, DjangoObjectType):
     class Meta:
         model = RelativeIndex
         interfaces = (graphene.relay.Node,)
@@ -107,8 +108,16 @@ class ProcessBatchMutation(OpenIMISMutation):
     def async_mutate(cls, user, **data):
         if not user.has_perms(ClaimBatchConfig.gql_mutation_process_batch_perms):
             raise PermissionDenied(_("unauthorized"))
+        location_id = data.get('location_id', None)
+        if location_id == -1:
+            location_id = None
+        # the batch valuates the claims and triggers the payment calculation rules of
+        # its location: a region / district of the user's, national (null / -1) only
+        # for a user who is not location restricted
+        if not batch_location_allowed(user, location_id):
+            raise PermissionDenied(_("unauthorized"))
         submit = ProcessBatchSubmit(
-            location_id=data.get('location_id', None),
+            location_id=location_id,
             year=data['year'],
             month=data['month']
         )
@@ -120,6 +129,7 @@ class ProcessBatchMutation(OpenIMISMutation):
 class Query(graphene.ObjectType):
     batch_runs = OrderedDjangoFilterConnectionField(
         BatchRunGQLType,
+        **row_filter_arguments(),
         orderBy=graphene.List(of_type=graphene.String))
     batch_runs_summaries = graphene.relay.ConnectionField(
         BatchRunSummaryConnection,
@@ -131,15 +141,28 @@ class Query(graphene.ObjectType):
         accountProduct=graphene.Int(),
         accountCareType=graphene.String()
     )
-    relative_indexes = DjangoFilterConnectionField(RelativeIndexGQLType)
+    relative_indexes = OrderedDjangoFilterConnectionField(
+        RelativeIndexGQLType,
+        **row_filter_arguments(),
+        orderBy=graphene.List(of_type=graphene.String))
 
     def resolve_batch_runs(self, info, **kwargs):
         if not info.context.user.has_perms(ClaimBatchConfig.gql_query_batch_runs_perms):
             raise PermissionDenied(_("unauthorized"))
+        # the runs of the user's locations (and national ones) by BatchRun.get_queryset
+        # (BatchRunGQLType); current ones unless isDeleted / showHistory ask (OP-2029)
+        legacy_row_filters(info, kwargs, validity=Validity.NOW)
+        return BatchRun.objects.all()
 
     def resolve_batch_runs_summaries(self, info, **kwargs):
-        if not info.context.user.has_perms(ClaimBatchConfig.gql_query_batch_runs_perms):
+        user = info.context.user
+        if not user.has_perms(ClaimBatchConfig.gql_query_batch_runs_perms):
             raise PermissionDenied(_("unauthorized"))
+        # the district (or else the region) asked for must be one of the user's; no
+        # location means the national indexes, visible to all (as BatchRun.row_scope)
+        location_id = kwargs.get('accountDistrict') or kwargs.get('accountRegion')
+        if location_id and not batch_location_allowed(user, location_id):
+            return []
         sql_params, params = batchRunSummaryFilter(**kwargs)
         if settings.MSSQL:
             sql = '''
@@ -207,8 +230,16 @@ class Query(graphene.ObjectType):
             return res
 
     def resolve_relative_indexes(self, info, **kwargs):
-        if not info.context.user.has_perms(ClaimBatchConfig.gql_query_relative_indexes_perms):
+        # an empty right list would let anyone read: the batch run search right then
+        perms = ClaimBatchConfig.gql_query_relative_indexes_perms \
+            or ClaimBatchConfig.gql_query_batch_runs_perms
+        user = info.context.user
+        if not user.is_authenticated or not user.has_perms(perms):
             raise PermissionDenied(_("unauthorized"))
+        # the indexes of the user's locations (and national ones) by
+        # RelativeIndex.get_queryset (RelativeIndexGQLType); current ones (OP-2029)
+        legacy_row_filters(info, kwargs, validity=Validity.NOW)
+        return RelativeIndex.objects.all()
 
 
 class Mutation(graphene.ObjectType):
